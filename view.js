@@ -118,6 +118,42 @@ let mc = null;
 let live = null;
 let busy = false;
 let gotStream = false;
+let curOfferVer = null;
+let discoTimer = null;
+
+function teardownToWaiting() {
+  gotStream = false;
+  try { if (pc) pc.close(); } catch (_) {}
+  pc = null;
+  $('player').style.display = 'none';
+  $('topbar').style.display = 'none';
+  $('stage').style.display = 'flex';
+  $('playBtn').style.display = 'none';
+  if (code) {
+    big('Связь прервана.', 'Не закрывайте страницу — подключимся снова, как только эфир возобновится.');
+    waitForOffer();
+  } else {
+    big('Связь прервана.', 'Обновите страницу или попросите новую ссылку.');
+  }
+}
+
+/* Показать, каким путём пошёл трафик (direct/relay) — для диагностики */
+function showConnPath() {
+  setTimeout(async () => {
+    try {
+      const st = await pc.getStats();
+      st.forEach((r) => {
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') {
+          const l = st.get(r.localCandidateId), rm = st.get(r.remoteCandidateId);
+          const how = (l ? l.candidateType : '?') + ' → ' + (rm ? rm.candidateType : '?');
+          window.__vdiag.path = how;
+          const sm = $('submsg');
+          if (sm && $('bigmsg').textContent === 'Эфир готов!') sm.textContent = 'канал: ' + how + (how.includes('relay') ? ' (ретранслятор)' : ' (прямой)');
+        }
+      });
+    } catch (_) {}
+  }, 2500);
+}
 
 function big(msg, sub) {
   $('bigmsg').textContent = msg;
@@ -163,19 +199,17 @@ async function connectToOffer(offerB64) {
     pc.onconnectionstatechange = () => {
       const st = pc.connectionState;
       if (st === 'connected') {
+        clearTimeout(discoTimer);
         big('Эфир готов!', '');
-      } else if (st === 'failed' || st === 'disconnected' || st === 'closed') {
-        gotStream = false;
-        $('player').style.display = 'none';
-        $('topbar').style.display = 'none';
-        $('stage').style.display = 'flex';
-        $('playBtn').style.display = 'none';
-        if (code) {
-          big('Связь прервана.', 'Не закрывайте страницу — подключимся снова, как только эфир возобновится.');
-          waitForOffer();
-        } else {
-          big('Связь прервана.', 'Обновите страницу или попросите новую ссылку.');
-        }
+        showConnPath();
+      } else if (st === 'disconnected') {
+        // короткие обрывы на мобильных сетях/VPN часто восстанавливаются сами
+        big('Связь прерывается…', 'Восстанавливаем автоматически, ничего нажимать не нужно.');
+        clearTimeout(discoTimer);
+        discoTimer = setTimeout(() => teardownToWaiting(), 7000);
+      } else if (st === 'failed' || st === 'closed') {
+        clearTimeout(discoTimer);
+        teardownToWaiting();
       }
     };
     await pc.setRemoteDescription(offer);
@@ -237,7 +271,18 @@ function waitForOffer() {
         }
       }
       if (topic === `kl/${code}/o` && data.length > 40) {
-        connectToOffer(data);
+        // Формат: KL1.<версия>.<b64 SDP>. Повторный оффер той же версии при
+        // живом соединении игнорируем — не рвём рабочий эфир из-за реконнекта брокера.
+        let ver = 'legacy', payload = data;
+        if (data.startsWith('KL1.')) {
+          const parts = data.split('.');
+          ver = parts[1] || 'x';
+          payload = parts.slice(2).join('.');
+        }
+        const healthy = pc && pc.connectionState === 'connected';
+        if (ver === curOfferVer && healthy) return;
+        curOfferVer = ver;
+        connectToOffer(payload);
       }
     });
     mc.on('error', (e) => {
@@ -246,6 +291,13 @@ function waitForOffer() {
     });
     mc.on('offline', () => { window.__vdiag.err.push('mqtt offline'); });
     mc.on('message', (topic) => { window.__vdiag.lastTopic = topic; });
+  }
+  // Пока ждём и не подключены — периодически переподписываемся:
+  // брокер заново присылает retained-оффер, так мы подхватим свежую версию
+  // после автопересоздания эфира на стороне отправителя.
+  if (mc && mc.connected && !(pc && pc.connectionState === 'connected')) {
+    mc.subscribe(`kl/${code}/o`);
+    mc.subscribe(`kl/${code}/live`);
   }
   waitingTimer = setTimeout(waitForOffer, 15000);
 }
