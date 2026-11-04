@@ -123,6 +123,7 @@ let discoTimer = null;
 
 function teardownToWaiting() {
   gotStream = false;
+  stopViewerStats();
   try { if (pc) pc.close(); } catch (_) {}
   pc = null;
   $('player').style.display = 'none';
@@ -147,12 +148,45 @@ function showConnPath() {
           const l = st.get(r.localCandidateId), rm = st.get(r.remoteCandidateId);
           const how = (l ? l.candidateType : '?') + ' → ' + (rm ? rm.candidateType : '?');
           window.__vdiag.path = how;
-          const sm = $('submsg');
-          if (sm && $('bigmsg').textContent === 'Эфир готов!') sm.textContent = 'канал: ' + how + (how.includes('relay') ? ' (ретранслятор)' : ' (прямой)');
         }
       });
     } catch (_) {}
   }, 2500);
+}
+
+/* Живой индикатор в панели: сколько видео/звука реально доходит.
+   Если цифры стоят на нуле — проблема в сети, а не в телефоне. */
+let vStatsTimer = null, vLastVideo = 0, vLastAudio = 0, vZeroSince = 0;
+function stopViewerStats() { clearInterval(vStatsTimer); vStatsTimer = null; }
+function startViewerStats() {
+  stopViewerStats();
+  vLastVideo = 0; vLastAudio = 0; vZeroSince = Date.now();
+  const tag = $('netTag');
+  vStatsTimer = setInterval(async () => {
+    if (!pc) { stopViewerStats(); return; }
+    try {
+      const st = await pc.getStats();
+      let vb = 0, ab = 0;
+      st.forEach((r) => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video') vb += r.bytesReceived || 0;
+        if (r.type === 'inbound-rtp' && r.kind === 'audio') ab += r.bytesReceived || 0;
+      });
+      const vkbps = Math.round((vb - vLastVideo) * 8 / 1000 / 2);
+      const akbps = Math.round((ab - vLastAudio) * 8 / 1000 / 2);
+      vLastVideo = vb; vLastAudio = ab;
+      const path = window.__vdiag.path || '';
+      if (vb + ab > 0) vZeroSince = 0;
+      if (tag) {
+        if (vb + ab === 0 && vZeroSince && Date.now() - vZeroSince > 6000) {
+          tag.textContent = '⚠ видео не доходит (' + (path || 'канал неизвестен') + ')';
+          tag.style.color = '#ff8484';
+        } else {
+          tag.textContent = '▸ ' + vkbps + ' кбит/с видео · ' + akbps + ' кбит/с звук' + (path ? ' · ' + path : '');
+          tag.style.color = '';
+        }
+      }
+    } catch (_) {}
+  }, 2000);
 }
 
 function big(msg, sub) {
@@ -202,6 +236,7 @@ async function connectToOffer(offerB64) {
         clearTimeout(discoTimer);
         big('Эфир готов!', '');
         showConnPath();
+        startViewerStats();
       } else if (st === 'disconnected') {
         // короткие обрывы на мобильных сетях/VPN часто восстанавливаются сами
         big('Связь прерывается…', 'Восстанавливаем автоматически, ничего нажимать не нужно.');
@@ -319,8 +354,27 @@ if (manualOffer && manualOffer.length > 40) {
 }
 
 /* ---------- Управление воспроизведением ---------- */
+async function tryPlay() {
+  const v = $('player');
+  try {
+    await v.play(); // со звуком
+    return true;
+  } catch (e1) {
+    try {
+      v.muted = true;               // мобильные часто требуют жест для звука —
+      await v.play();               // запускаем беззвучно, потом возвращаем звук
+      try { v.muted = false; } catch (_) {}
+      return true;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
 $('playBtn').onclick = async () => {
-  try { await $('player').play(); } catch (_) {}
+  if (!(await tryPlay())) {
+    big('Браузер блокирует воспроизведение.', 'Нажмите на чёрный экран ещё раз.');
+    return;
+  }
   showPlayer();
 };
 $('player').onclick = async () => {
