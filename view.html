@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Просмотр эфира — KinoLink</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #000; color: #fff; font: 15px/1.5 "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; text-align: center; padding: 24px; }
+  .spinner { width: 52px; height: 52px; border: 4px solid rgba(255,255,255,.15); border-top-color: #4f8cff; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 22px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #bigmsg { font-size: clamp(17px, 2.6vw, 26px); font-weight: 600; max-width: 640px; }
+  #submsg { margin-top: 10px; color: #9aa3b2; font-size: 14px; max-width: 560px; }
+  #playBtn { display: none; margin-top: 26px; background: #4f8cff; border: 0; color: #fff; font-size: 19px; font-weight: 700; padding: 16px 44px; border-radius: 14px; cursor: pointer; box-shadow: 0 8px 30px rgba(79,140,255,.4); }
+  #playBtn:active { transform: scale(.97); }
+  video#player { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; display: none; }
+  #topbar { position: fixed; top: 0; left: 0; right: 0; display: none; justify-content: space-between; align-items: center; padding: 10px 14px; background: linear-gradient(rgba(0,0,0,.75), transparent); z-index: 5; }
+  #liveTag { background: #e02424; border-radius: 6px; padding: 3px 12px; font-size: 12.5px; font-weight: 700; letter-spacing: .05em; }
+  #fsBtn { background: rgba(255,255,255,.14); border: 0; color: #fff; border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+  #codeBox { margin-top: 22px; color: #9aa3b2; font-size: 13px; }
+  #codeBox b { color: #fff; font-family: Consolas, monospace; letter-spacing: .1em; }
+  textarea { width: min(92vw, 560px); height: 90px; background: #14181f; color: #cfe0ff; border: 1px solid #2a3142; border-radius: 10px; padding: 10px; font-family: Consolas, monospace; font-size: 11px; margin-top: 16px; }
+  .copyBtn { margin-top: 10px; background: #232a3a; color: #fff; border: 1px solid #39415a; border-radius: 9px; padding: 10px 22px; font-size: 14px; cursor: pointer; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #3ecf8e; margin-right: 7px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="spinner" id="spinner"></div>
+  <div id="bigmsg">Открываем эфир…</div>
+  <div id="submsg"></div>
+  <button id="playBtn">▶ Нажмите, чтобы смотреть со звуком</button>
+  <div id="codeBox"></div>
+  <textarea id="answerOut" readonly style="display:none"></textarea>
+  <button class="copyBtn" id="copyAnswer" style="display:none">📋 Скопировать код</button>
+</div>
+<video id="player" autoplay playsinline></video>
+<div id="topbar">
+  <span id="liveTag"><span class="dot"></span>ПРЯМОЙ ЭФИР</span>
+  <button id="fsBtn">⛶ Во весь экран</button>
+</div>
+<script src="view.js"></script>
+</body>
+</html>
