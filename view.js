@@ -1,0 +1,289 @@
+/* KinoLink — страница зрителя (режиссёр). Один файл, без установки. */
+'use strict';
+
+window.__vdiag = { stage: 'boot', err: [] };
+window.onerror = (m, s, l, c) => { window.__vdiag.err.push(String(m) + ' @' + l + ':' + c); };
+
+const $ = (id) => document.getElementById(id);
+const MQTT_URL = 'wss://broker.emqx.io:8084/mqtt';
+const STUN_LIST = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.yandex.net:3478' },
+  { urls: 'stun:stun.3cx.com:3478' },
+  { urls: 'stun:stun.voiparound.com:3478' },
+  { urls: ['turn:openrelay.metered.ca:443?transport=tcp',
+           'turn:openrelay.metered.ca:80?transport=tcp',
+           'turn:openrelay.metered.ca:443',
+           'turn:openrelay.metered.ca:80'],
+    username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: ['turn:freestun.net:3478?transport=tcp', 'turn:freestun.net:3478'],
+    username: 'free', credential: 'free' }
+];
+
+/* Минимальный MQTT 3.1.1 поверх WebSocket (QoS 0) — вместо тяжёлой библиотеки.
+   API совместим с используемым здесь подмножеством mqtt.js: connect/on/subscribe/publishAsync/connected. */
+function klMqttConnect(url, opts) {
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const handlers = {};
+  let ws = null, connected = false, killed = false, pktId = 1, pingT = null, connT = null, recT = null;
+  const api = {
+    get connected() { return connected; },
+    on(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return api; },
+    subscribe(topic) {
+      const t = enc.encode(topic);
+      const body = new Uint8Array(2 + 2 + t.length + 1);
+      body[0] = pktId >> 8; body[1] = pktId++ & 255;
+      body[2] = t.length >> 8; body[3] = t.length & 255; body.set(t, 4); body[4 + t.length] = 0;
+      send(packet(0x82, body));
+    },
+    async publishAsync(topic, payload) {
+      const t = enc.encode(topic), d = enc.encode(String(payload));
+      const body = new Uint8Array(2 + t.length + d.length);
+      body[0] = t.length >> 8; body[1] = t.length & 255; body.set(t, 2); body.set(d, 2 + t.length);
+      send(packet(0x30, body));
+    },
+    end() { killed = true; clearTimeout(recT); try { ws && ws.close(); } catch (_) {} }
+  };
+  function emit(ev, a, b) { (handlers[ev] || []).forEach((f) => { try { f(a, b); } catch (_) {} }); }
+  function packet(typeFlags, body) {
+    let n = body.length, len = [];
+    do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 0x80; len.push(d); } while (n > 0);
+    const out = new Uint8Array(1 + len.length + body.length);
+    out[0] = typeFlags; out.set(len, 1); out.set(body, 1 + len.length);
+    return out;
+  }
+  function send(u8) { if (ws && ws.readyState === 1) ws.send(u8); }
+  function parseVarLen(d, p) { let m = 1, v = 0, b; do { b = d[p++]; v += (b & 127) * m; m *= 128; } while (b & 128); return [v, p]; }
+  function onPacket(d) {
+    const type = d[0] >> 4;
+    const [rl, p0] = parseVarLen(d, 1);
+    const p = p0;
+    if (type === 2) { // CONNACK
+      if (d[p + 1] === 0) {
+        connected = true;
+        clearTimeout(connT);
+        pingT = setInterval(() => send(new Uint8Array([0xC0, 0x00])), 30000);
+        emit('connect');
+      } else {
+        emit('error', new Error('MQTT refused, code ' + d[p + 1]));
+      }
+    } else if (type === 3) { // PUBLISH (QoS 0)
+      const tl = (d[p] << 8) | d[p + 1];
+      const topic = dec.decode(d.subarray(p + 2, p + 2 + tl));
+      emit('message', topic, dec.decode(d.subarray(p + 2 + tl)));
+    } else if (type === 13) { /* PINGRESP */ }
+  }
+  function open() {
+    ws = new WebSocket(url, 'mqtt');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      const c = enc.encode(opts.clientId || 'kl_' + Math.random().toString(36).slice(2, 10));
+      const vh = enc.encode('MQTT');
+      const body = new Uint8Array(2 + vh.length + 4 + 2 + c.length);
+      let o = 0;
+      body[o++] = vh.length >> 8; body[o++] = vh.length & 255; body.set(vh, o); o += vh.length;
+      body[o++] = 4;        // уровень протокола MQTT 3.1.1
+      body[o++] = 2;        // clean session
+      body[o++] = 0; body[o++] = 60; // keepalive
+      body[o++] = c.length >> 8; body[o++] = c.length & 255; body.set(c, o);
+      send(packet(0x10, body));
+      clearTimeout(connT);
+      connT = setTimeout(() => { try { ws.close(); } catch (_) {} }, opts.connectTimeout || 9000);
+    };
+    ws.onmessage = (ev) => onPacket(new Uint8Array(ev.data));
+    ws.onerror = () => emit('error', new Error('ошибка WebSocket'));
+    ws.onclose = () => {
+      clearInterval(pingT); clearTimeout(connT);
+      if (connected) { connected = false; emit('offline'); }
+      if (!killed) recT = setTimeout(open, opts.reconnectPeriod || 4000);
+    };
+  }
+  open();
+  return api;
+}
+
+const b64d = (s) => new TextDecoder().decode(Uint8Array.from(
+  atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - s.length % 4) % 4)),
+  (c) => c.charCodeAt(0)));
+const b64e = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+const hash = new URLSearchParams(location.hash.slice(1));
+const code = (hash.get('c') || '').replace(/[^A-Za-z0-9_-]/g, '');
+const manualOffer = hash.get('o');
+
+let pc = null;
+let inboundStream = null;
+let mc = null;
+let live = null;
+let busy = false;
+let gotStream = false;
+
+function big(msg, sub) {
+  $('bigmsg').textContent = msg;
+  $('submsg').textContent = sub || '';
+}
+function showPlayer() {
+  $('stage').style.display = 'none';
+  $('player').style.display = 'block';
+  $('topbar').style.display = 'flex';
+  $('playBtn').style.display = 'none';
+}
+function gatherComplete(p, ms = 9000) {
+  if (p.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((res) => {
+    const to = setTimeout(res, ms);
+    p.addEventListener('icegatheringstatechange', () => {
+      if (p.iceGatheringState === 'complete') { clearTimeout(to); res(); }
+    });
+  });
+}
+
+async function connectToOffer(offerB64) {
+  if (busy) return;
+  busy = true;
+  try {
+    if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+    $('spinner').style.display = 'block';
+    big('Подключаемся к эфиру…', 'Обычно занимает 2–5 секунд.');
+    window.__vdiag.stage = 'got offer, connecting pc';
+    const offer = JSON.parse(b64d(offerB64));
+    pc = new RTCPeerConnection({ iceServers: STUN_LIST });
+    // Собираем входящий поток вручную: sendonly-трансиверы без msid могут
+    // давать пустой ev.streams — опираемся на сами треки.
+    inboundStream = new MediaStream();
+    pc.ontrack = (ev) => {
+      inboundStream.addTrack(ev.track);
+      gotStream = true;
+      $('player').srcObject = inboundStream;
+      $('spinner').style.display = 'none';
+      $('playBtn').style.display = 'inline-block';
+      big('Эфир готов!', '');
+    };
+    pc.onconnectionstatechange = () => {
+      const st = pc.connectionState;
+      if (st === 'connected') {
+        big('Эфир готов!', '');
+      } else if (st === 'failed' || st === 'disconnected' || st === 'closed') {
+        gotStream = false;
+        $('player').style.display = 'none';
+        $('topbar').style.display = 'none';
+        $('stage').style.display = 'flex';
+        $('playBtn').style.display = 'none';
+        if (code) {
+          big('Связь прервана.', 'Не закрывайте страницу — подключимся снова, как только эфир возобновится.');
+          waitForOffer();
+        } else {
+          big('Связь прервана.', 'Обновите страницу или попросите новую ссылку.');
+        }
+      }
+    };
+    await pc.setRemoteDescription(offer);
+    await pc.setLocalDescription(await pc.createAnswer());
+    window.__answerB64 = b64e(JSON.stringify(pc.localDescription));
+    await gatherComplete(pc);
+    if (code && mc && mc.connected) {
+      await mc.publishAsync(`kl/${code}/a`, b64e(JSON.stringify(pc.localDescription)));
+      big('Ответ отправлен.', 'Устанавливаем соединение…');
+    } else {
+      const ans = 'KLANS1.' + b64e(JSON.stringify(pc.localDescription));
+      $('answerOut').value = ans;
+      $('answerOut').style.display = 'block';
+      $('copyAnswer').style.display = 'inline-block';
+      $('playBtn').style.display = 'none';
+      big('Эфир подготовлен.', 'Пришлите код ниже тому, кто дал вам ссылку — например, в Telegram или WhatsApp.');
+      try { await navigator.clipboard.writeText(ans); $('copyAnswer').textContent = '✔ Скопировано'; } catch (_) {}
+    }
+  } catch (e) {
+    big('Не удалось подключиться.', String(e.message || e));
+    if (code) setTimeout(waitForOffer, 4000);
+  } finally {
+    busy = false;
+  }
+}
+
+/* Ожидание объявления эфира и предложения (автоматический режим) */
+let waitingTimer = null;
+function waitForOffer() {
+  if (!code || busy) return;
+  clearTimeout(waitingTimer);
+  window.__vdiag.stage = 'waitForOffer';
+  if (!mc || !mc.connected) {
+    big('Соединяемся…', '');
+    window.__vdiag.stage = 'mqtt connecting, klMqttConnect=' + typeof klMqttConnect;
+    mc = klMqttConnect(MQTT_URL, {
+      clientId: 'klview_' + Math.random().toString(36).slice(2, 12),
+      connectTimeout: 9000,
+      reconnectPeriod: 4000
+    });
+    mc.on('connect', () => {
+      window.__vdiag.stage = 'mqtt connected';
+      mc.subscribe(`kl/${code}/live`);
+      mc.subscribe(`kl/${code}/o`);
+    });
+    mc.on('message', (topic, payload) => {
+      const data = payload.toString();
+      if (topic === `kl/${code}/live`) {
+        live = data === '1';
+        if (live) {
+          big('Эфир начинается…', 'Подключаемся.');
+        } else {
+          $('player').style.display = 'none';
+          $('topbar').style.display = 'none';
+          $('stage').style.display = 'flex';
+          $('playBtn').style.display = 'none';
+          $('spinner').style.display = 'block';
+          big('Эфир сейчас не идёт.', 'Оставьте страницу открытой — как только начнётся показ, видео появится само.');
+        }
+      }
+      if (topic === `kl/${code}/o` && data.length > 40) {
+        connectToOffer(data);
+      }
+    });
+    mc.on('error', (e) => {
+      window.__vdiag.err.push('mqtt error: ' + String(e && e.message || e));
+      big('Проблема с соединением.', 'Проверьте интернет и обновите страницу.');
+    });
+    mc.on('offline', () => { window.__vdiag.err.push('mqtt offline'); });
+    mc.on('message', (topic) => { window.__vdiag.lastTopic = topic; });
+  }
+  waitingTimer = setTimeout(waitForOffer, 15000);
+}
+
+/* ---------- Старт ---------- */
+if (manualOffer && manualOffer.length > 40) {
+  $('codeBox').innerHTML = '';
+  connectToOffer(manualOffer);
+} else if (code) {
+  $('codeBox').innerHTML = 'Код эфира: <b>' + code + '</b>';
+  if (typeof window.KL_TEST_NO_MQTT === 'undefined' || !window.KL_TEST_NO_MQTT) {
+    waitForOffer();
+  } else {
+    big('Тестовый режим — ждём предложения…', '');
+  }
+} else {
+  $('spinner').style.display = 'none';
+  big('Ссылка неполная.', 'Попросите ссылку у отправителя ещё раз.');
+}
+
+/* ---------- Управление воспроизведением ---------- */
+$('playBtn').onclick = async () => {
+  try { await $('player').play(); } catch (_) {}
+  showPlayer();
+};
+$('player').onclick = async () => {
+  if ($('player').paused) { try { await $('player').play(); } catch (_) {} }
+};
+$('copyAnswer').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($('answerOut').value);
+    $('copyAnswer').textContent = '✔ Скопировано';
+  } catch (_) {
+    $('answerOut').select();
+    document.execCommand('copy');
+  }
+};
+$('fsBtn').onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+};
